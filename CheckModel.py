@@ -17,8 +17,9 @@ from torch.nn.parameter import Parameter
 MODEL_PATH = "best_model.pt"
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-# Labels: 7 classes (non-drone removed)
-drone_labels = ["DJI", "FutabaT14", "FutabaT7", "Graupner", "Taranis", "Turnigy", "Noise"]
+# Labels: 7 classes. MUST match the Kaggle dataset training order
+# (class_stats.csv): index 4 = Noise, 5 = Taranis, 6 = Turnigy.
+drone_labels = ["DJI", "FutabaT14", "FutabaT7", "Graupner", "Noise", "Taranis", "Turnigy"]
 
 # ---- Stubs for old pickled classes ----
 class OptimizedTemporalModel(nn.Module):

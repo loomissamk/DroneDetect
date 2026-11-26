@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import librosa
 
 # Device setup
-device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load trained model
 MODEL_PATH = "best_model.pt"

@@ -43,10 +43,11 @@ TOPK_TO_LOG    = 2      # how many top classes to log/display
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # ===================== LABELS =======================
-# We removed "non-drone" from the UI list (7 classes total).
-drone_labels = ["DJI", "FutabaT14", "FutabaT7", "Graupner", "Taranis", "Turnigy", "Noise"]
-# In the old 8-class checkpoint, "non-drone" was the last index (7).
-NON_DRONE_IDX_IN_OLD = 7
+# 7 classes, MUST match the training label order in the Kaggle dataset
+# (class_stats.csv): index 4 is Noise, 5 is Taranis, 6 is Turnigy.
+# An earlier copy put Noise last, which shifted index 4 to "Taranis" — the
+# dominant Noise class then printed as Taranis, the "only predicts Taranis" bug.
+drone_labels = ["DJI", "FutabaT14", "FutabaT7", "Graupner", "Noise", "Taranis", "Turnigy"]
 
 # ===================== MODEL ========================
 class EnhancedTemporalModel(nn.Module):
@@ -133,20 +134,23 @@ def load_checkpoint_as_state_dict(path: str, map_location):
         return obj
     raise RuntimeError("Checkpoint is neither a Module nor a tensor state_dict.")
 
-# Build model with 8 outputs to match the checkpoint, then slice at inference.
-model = EnhancedTemporalModel(num_classes=8).to(device)
+# The checkpoint (best_model.pt) is a 7-class head (DJI, FutabaT14, FutabaT7,
+# Graupner, Taranis, Turnigy, Noise). Build the same 7-class model and load
+# strictly so a mismatched checkpoint fails loudly instead of silently
+# mislabeling (the old 8-class + drop_non_drone path loaded a random 8th
+# column, which is why one class dominated the output).
+model = EnhancedTemporalModel(num_classes=len(drone_labels)).to(device)
 state_dict = load_checkpoint_as_state_dict(MODEL_PATH, device)
-missing, unexpected = model.load_state_dict(state_dict, strict=False)
+final_weight = state_dict.get("fc.3.weight")
+if final_weight is not None and final_weight.shape[0] != len(drone_labels):
+    raise RuntimeError(
+        f"Checkpoint has {final_weight.shape[0]} output classes but the label list has "
+        f"{len(drone_labels)}. Re-point drone_labels or retrain before loading."
+    )
+missing, unexpected = model.load_state_dict(state_dict, strict=True)
 print(f"[loader] Missing keys: {sorted(missing)}")
 print(f"[loader] Unexpected keys: {sorted(unexpected)}")
 model.eval()
-
-def drop_non_drone(logits: torch.Tensor, drop_idx: int = NON_DRONE_IDX_IN_OLD) -> torch.Tensor:
-    """Remove the 'non-drone' column from 8-logit output -> 7-logit output."""
-    # logits: [B, 8]  -> returns [B, 7]
-    if logits.shape[1] != 8:
-        return logits  # if you later swap to a true 7-class head, no-op
-    return torch.cat([logits[:, :drop_idx], logits[:, drop_idx+1:]], dim=1)
 
 # =================== RUNTIME SIZES ==================
 SAMPLES = int(SAMPLE_RATE * RECORD_SECS)   # complex samples (I+Q per sample)
@@ -261,10 +265,9 @@ class SignalScanner(QtCore.QThread):
                                 np.stack((re, im)), dtype=torch.float32
                             ).unsqueeze(0).to(device)
 
-                            logits8 = model(tensor)            # [B, 8] from checkpoint head
-                            logits7 = drop_non_drone(logits8)  # [B, 7]; remove 'non-drone'
+                            logits = model(tensor)           # [B, 7] from checkpoint head
 
-                            probs = F.softmax(logits7, dim=1)           # [B, 7]
+                            probs = F.softmax(logits, dim=1)           # [B, 7]
                             topk_prob, topk_idx = torch.topk(
                                 probs, k=min(TOPK_TO_LOG, probs.shape[1]), dim=1
                             )

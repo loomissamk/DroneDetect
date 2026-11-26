@@ -45,6 +45,16 @@ except Exception:
     SOAPY_SDR_CF32 = SOAPY_SDR_RX = SOAPY_SDR_TIMEOUT = None
     HAVE_SOAPY = False
 
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    HAVE_TORCH = True
+except Exception:
+    torch = nn = F = None
+    HAVE_TORCH = False
+
 
 # ========================== CONFIG ==========================
 DEFAULT_START_FREQ = 10e6
@@ -86,15 +96,27 @@ DECODER_MODE_OPTIONS = [
     ("off", "Off"),
 ]
 
+# Quick-sweep band presets. The "Full" preset covers the HackRF's whole
+# 1 MHz-6 GHz passband; on narrower radios the range is clamped and the
+# profile hint explains which band the radio can actually reach.
+BAND_PRESETS = [
+    ("sub_ghz",   "Sub-GHz (400-490 MHz)",    "400m-490m",    100e3,  2.4e6),
+    ("gps_l1",    "GPS L1 (1570-1580 MHz)",   "1570m-1580m",  50e3,   5.6e6),
+    ("gps_l5",    "GPS L5 (1170-1180 MHz)",   "1170m-1180m",  50e3,   5.6e6),
+    ("wifi_2g",   "WiFi 2.4 GHz (2400-2500 MHz)", "2.400g-2.500g", 1e6, 20e6),
+    ("wifi_5g",   "WiFi/Video 5.8 GHz (5725-5875 MHz)", "5725m-5875m", 1e6, 20e6),
+    ("full",      "Full band (10 MHz-6 GHz)", "10m-6g",       1e6,    20e6),
+]
+
 DEVICE_PROFILES = {
     "hackrf": {
         "display": "HackRF",
-        "default_range": "2.400g-2.500g",
+        "default_range": "10m-6g",
         "sample_rate": 20e6,
         "step_hz": 1e6,
         "min_freq_hz": 1e6,
         "max_freq_hz": 6e9,
-        "hint": "Wideband sweeps and 2.4/5.8 GHz work well here.",
+        "hint": "Full 1 MHz-6 GHz passband. Full-band sweep at 1 MHz step is ~5,990 steps.",
     },
     "rtlsdr": {
         "display": "RTL-SDR",
@@ -103,7 +125,7 @@ DEVICE_PROFILES = {
         "step_hz": 100e3,
         "min_freq_hz": 24e6,
         "max_freq_hz": 1766e6,
-        "hint": "Use sub-GHz, VHF, or lower UHF bands. 2.4 GHz is out of range.",
+        "hint": "Use sub-GHz, VHF, or lower UHF bands. 2.4 GHz and above are out of range.",
     },
     "sdrplay": {
         "display": "SDRplay",
@@ -112,7 +134,7 @@ DEVICE_PROFILES = {
         "step_hz": 250e3,
         "min_freq_hz": 1e3,
         "max_freq_hz": 2e9,
-        "hint": "Good middle ground for sub-GHz and lower microwave work.",
+        "hint": "Good middle ground for sub-GHz and lower microwave work (up to ~2 GHz).",
     },
     "generic": {
         "display": "Generic SDR",
@@ -124,6 +146,159 @@ DEVICE_PROFILES = {
         "hint": "Profile is unknown. Start with a narrow band and moderate sample rate.",
     },
 }
+
+
+# ========================== MODEL ===========================
+# Optional drone classifier, self-contained so Scanner.py works with or
+# without it. Mirrors best_model.pt's architecture (7 classes). When torch
+# is unavailable or the checkpoint is missing, the scanner still runs.
+DEFAULT_MODEL_PATH = "best_model.pt"
+# MUST match the Kaggle dataset training order (class_stats.csv):
+# index 4 = Noise, 5 = Taranis, 6 = Turnigy. (Noise last was the bug.)
+DRONE_LABELS = ["DJI", "FutabaT14", "FutabaT7", "Graupner", "Noise", "Taranis", "Turnigy"]
+
+
+def _make_model_class():
+    class EnhancedTemporalModel(nn.Module):
+        """CNN -> GRU -> Transformer -> head. Matches best_model.pt exactly."""
+
+        def __init__(self, num_classes: int):
+            super().__init__()
+            self.cnn = nn.Sequential(
+                nn.Conv1d(2, 64, kernel_size=5, stride=1, padding=2), nn.ReLU(),
+                nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3), nn.ReLU(),
+                nn.Conv1d(128, 256, kernel_size=9, stride=2, padding=4), nn.ReLU(),
+                nn.AdaptiveMaxPool1d(64),
+            )
+            self.rnn = nn.GRU(input_size=256, hidden_size=256, num_layers=3, batch_first=True, dropout=0.3)
+            enc = nn.TransformerEncoderLayer(d_model=256, nhead=4, dim_feedforward=1024, dropout=0.3, batch_first=True)
+            self.transformer = nn.TransformerEncoder(enc, num_layers=3)
+            self.fc = nn.Sequential(
+                nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.4),
+                nn.Linear(128, num_classes),
+            )
+
+        def forward(self, iq_signal):
+            x = self.cnn(iq_signal).permute(0, 2, 1)
+            x, _ = self.rnn(x)
+            x = self.transformer(x)
+            x = torch.mean(x, dim=1)
+            return self.fc(x)
+
+    return EnhancedTemporalModel
+
+
+EnhancedTemporalModel = _make_model_class() if HAVE_TORCH else None
+
+
+def _make_drone_cnn():
+    class DroneCNN(nn.Module):
+        """4-block CNN for 2-channel IQ [B,2,N] -> num_classes (best_model_v3.pt)."""
+
+        def __init__(self, num_classes: int = 7):
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv1d(2, 32, 15, stride=2, padding=7), nn.BatchNorm1d(32), nn.ReLU(),
+                nn.Conv1d(32, 32, 11, padding=5), nn.BatchNorm1d(32), nn.ReLU(),
+                nn.MaxPool1d(2), nn.Dropout(0.1),
+                nn.Conv1d(32, 64, 11, stride=2, padding=5), nn.BatchNorm1d(64), nn.ReLU(),
+                nn.Conv1d(64, 64, 7, padding=3), nn.BatchNorm1d(64), nn.ReLU(),
+                nn.MaxPool1d(2), nn.Dropout(0.15),
+                nn.Conv1d(64, 128, 7, stride=2, padding=3), nn.BatchNorm1d(128), nn.ReLU(),
+                nn.Conv1d(128, 128, 5, padding=2), nn.BatchNorm1d(128), nn.ReLU(),
+                nn.MaxPool1d(2), nn.Dropout(0.2),
+                nn.Conv1d(128, 256, 5, stride=2, padding=2), nn.BatchNorm1d(256), nn.ReLU(),
+                nn.Conv1d(256, 256, 3, padding=1), nn.BatchNorm1d(256), nn.ReLU(),
+            )
+            self.pool = nn.AdaptiveAvgPool1d(1)
+            self.classifier = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.3),
+                nn.Linear(128, num_classes),
+            )
+
+        def forward(self, x):
+            return self.classifier(self.pool(self.features(x)))
+
+    return DroneCNN
+
+
+DroneCNN = _make_drone_cnn() if HAVE_TORCH else None
+
+# Every model must expose a final Linear we can read the head off. Both
+# EnhancedTemporalModel (fc.3) and DroneCNN (classifier.4) end in one.
+def _model_head_weight(model):
+    for sub in ("fc", "classifier", "head"):
+        seq = getattr(model, sub, None)
+        if seq is not None and len(seq) > 0:
+            last = seq[-1]
+            if isinstance(last, nn.Linear):
+                return last
+    return None
+
+
+def _register_for_unpickle(*classes):
+    import sys as _sys
+    _main = _sys.modules.get("__main__")
+    if _main is None:
+        return
+    for cls in classes:
+        name = cls.__name__
+        if not hasattr(_main, name):
+            setattr(_main, name, cls)
+
+
+def load_drone_model(model_path: str = DEFAULT_MODEL_PATH, device=None):
+    """Load a 7-class drone checkpoint (EnhancedTemporalModel or DroneCNN).
+
+    Returns (model, labels) or (None, []). Fails soft: any error yields
+    (None, []) so the caller can skip classification without crashing the sweep.
+    Tries the heavy temporal model first, then the lighter v3 CNN.
+    """
+    if not HAVE_TORCH or not model_path or not os.path.exists(model_path):
+        return None, []
+    try:
+        device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        _register_for_unpickle(EnhancedTemporalModel, DroneCNN)
+        obj = torch.load(model_path, map_location=device, weights_only=False)
+        state_dict = obj.state_dict() if isinstance(obj, nn.Module) else obj
+    except Exception as exc:
+        print(f"[model] could not load {model_path}: {exc}")
+        return None, []
+
+    for arch_name, model in (
+        ("EnhancedTemporalModel", EnhancedTemporalModel(num_classes=len(DRONE_LABELS)).to(device)),
+        ("DroneCNN", DroneCNN(num_classes=len(DRONE_LABELS)).to(device)),
+    ):
+        try:
+            head = _model_head_weight(model)
+            if head is None or head.weight.shape[0] != len(DRONE_LABELS):
+                continue
+            model.load_state_dict(state_dict, strict=True)
+            model.eval()
+            print(f"[model] loaded {model_path} as {arch_name}")
+            return model, DRONE_LABELS
+        except Exception:
+            continue
+
+    print(f"[model] {model_path} did not match any known 7-class architecture")
+    return None, []
+
+
+def classify_iq(model, labels, iq: np.ndarray, sample_rate: float, max_samples: int = 1_048_576):
+    """Run the classifier on a captured IQ window. Returns (label, prob) or (None, 0.0)."""
+    if model is None or iq.size < 256:
+        return None, 0.0
+    head = _model_head_weight(model)
+    if head is None:
+        return None, 0.0
+    re = np.ascontiguousarray(iq.real[:max_samples].astype(np.float32))
+    im = np.ascontiguousarray(iq.imag[:max_samples].astype(np.float32))
+    tensor = torch.from_numpy(np.stack((re, im))).unsqueeze(0).to(head.weight.device)
+    with torch.no_grad():
+        probs = F.softmax(model(tensor), dim=1)[0]
+    idx = int(probs.argmax().item())
+    return (labels[idx], float(probs[idx].item())) if idx < len(labels) else (None, 0.0)
 
 
 # ========================== DATA ============================
@@ -1685,6 +1860,7 @@ class SweepThread(QtCore.QThread):
         record_cooldown_s: float,
         pause_on_detection: bool,
         decoder_mode: str,
+        model_path: Optional[str] = None,
     ):
         super().__init__()
         self.frequency_plan_hz = frequency_plan_hz
@@ -1700,6 +1876,7 @@ class SweepThread(QtCore.QThread):
         self.record_cooldown_s = float(record_cooldown_s)
         self.pause_on_detection = pause_on_detection
         self.decoder_mode = str(decoder_mode or DEFAULT_DECODER_MODE)
+        self.model, self.model_labels = load_drone_model(model_path or DEFAULT_MODEL_PATH)
 
         self.running = False
         self.paused = False
@@ -1815,6 +1992,8 @@ class SweepThread(QtCore.QThread):
                         "decoder_symbol_rate_hz",
                         "decoder_confidence",
                         "decoder_hex_preview",
+                        "model_label",
+                        "model_prob",
                         "recording_path",
                     ]
                 )
@@ -1859,6 +2038,15 @@ class SweepThread(QtCore.QThread):
                         except Exception as exc:
                             self.status.emit(f"Failed to save IQ clip: {exc}")
 
+                    model_label, model_prob = (None, 0.0)
+                    if self.model is not None and snapshot.detected:
+                        model_label, model_prob = classify_iq(self.model, self.model_labels, iq, self.sample_rate_hz)
+                        if model_label:
+                            self.status.emit(
+                                f"Classify @ {human_freq(snapshot.center_freq_hz)} -> {model_label} "
+                                f"({model_prob * 100:.1f}%)"
+                            )
+
                     writer.writerow(
                         [
                             snapshot.timestamp_utc,
@@ -1875,6 +2063,8 @@ class SweepThread(QtCore.QThread):
                             round(snapshot.decode_preview.symbol_rate_hz, 3),
                             round(snapshot.decode_preview.confidence, 3),
                             snapshot.decode_preview.hex_preview,
+                            (model_label or ""),
+                            round(model_prob, 4),
                             snapshot.recording_path,
                         ]
                     )
@@ -2280,8 +2470,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gain_input.setRange(0, 80)
         self.gain_input.setValue(GAIN)
 
+        self.preset_combo = QtWidgets.QComboBox()
+        self.preset_combo.addItem("Custom", "custom")
+        for key, label, _range, _step, _rate in BAND_PRESETS:
+            self.preset_combo.addItem(label, key)
+        self.preset_combo.setToolTip("Apply a quick band preset: sets Range, Step, and Sample rate.")
+        self.preset_combo.activated.connect(self.apply_band_preset)
+        self.preset_combo.setMinimumWidth(230)
+
         form.addRow("Backend", self.device_combo)
         form.addRow("Soapy args", self.soapy_args_input)
+        form.addRow("Band preset", self.preset_combo)
         form.addRow("Range", self.range_input)
         form.addRow("Step", step_widget)
         form.addRow("Sample rate", self.rate_input)
@@ -2314,6 +2513,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_locked_widgets = [
             self.device_combo,
             self.soapy_args_input,
+            self.preset_combo,
             self.range_input,
             self.step_input,
             self.step_unit,
@@ -2350,6 +2550,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.record_checkbox.setChecked(True)
         self.record_checkbox.toggled.connect(self._refresh_scan_meta)
 
+        self.model_checkbox = QtWidgets.QCheckBox("Classify detections (drone model)")
+        self.model_checkbox.setChecked(HAVE_TORCH)
+        self.model_checkbox.setToolTip(
+            "Runs best_model.pt (7 drone classes) on each detection. "
+            + ("" if HAVE_TORCH else "torch is not installed on this machine — install it to enable.")
+        )
+
         self.pause_on_hit_checkbox = QtWidgets.QCheckBox("Pause scan when a hit is found")
         self.pause_on_hit_checkbox.setChecked(False)
 
@@ -2371,6 +2578,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addRow("Decoder mode", self.decoder_mode_combo)
         layout.addRow("SNR gate", self.snr_gate_input)
         layout.addRow("Record hits", self.record_checkbox)
+        layout.addRow("Classify", self.model_checkbox)
         layout.addRow("Pause on hit", self.pause_on_hit_checkbox)
         layout.addRow("Record cooldown", self.cooldown_input)
         layout.addRow("Clip directory", self.record_dir_input)
@@ -2560,7 +2768,36 @@ class MainWindow(QtWidgets.QMainWindow):
         if force:
             self.capture_input.setValue(RECORD_SECS)
             self.gain_input.setValue(GAIN)
+        self.preset_combo.setCurrentIndex(0)
         self.refresh_profile_hint()
+
+    def apply_band_preset(self, _index: int):
+        key = self.preset_combo.currentData()
+        if not key or key == "custom":
+            return
+        preset = next((p for p in BAND_PRESETS if p[0] == key), None)
+        if preset is None:
+            return
+        _key, _label, range_text, step_hz, rate_hz = preset
+        # Clamp the preset range to the selected radio's real passband.
+        _, profile = self._selected_profile()
+        min_hz = float(profile.get("min_freq_hz", DEFAULT_START_FREQ))
+        max_hz = float(profile.get("max_freq_hz", DEFAULT_END_FREQ))
+        lo, hi = parse_range(range_text)
+        clamped_lo = max(lo, min_hz)
+        clamped_hi = min(hi, max_hz)
+        if clamped_lo >= clamped_hi:
+            self._set_status(
+                f"Preset {range_text} is outside this radio's range "
+                f"({human_freq(min_hz)}-{human_freq(max_hz)}); pick a preset the radio can reach."
+            )
+            return
+        self.range_input.setText(f"{clamped_lo / 1e6:.3f}m-{clamped_hi / 1e6:.3f}m")
+        step_value, step_unit = (step_hz / 1e6, "MHz") if step_hz >= 1e6 else (step_hz / 1e3, "kHz")
+        self.step_input.setValue(step_value)
+        self.step_unit.setCurrentText(step_unit)
+        self.rate_input.setValue(rate_hz / 1e6)
+        self._set_status(f"Applied preset: {_label} (clamped to radio range)")
 
     def _remember_sidebar_width(self, *_args):
         if self._workspace_mode != "all":
@@ -2867,6 +3104,7 @@ class MainWindow(QtWidgets.QMainWindow):
             record_cooldown_s=self.cooldown_input.value(),
             pause_on_detection=self.pause_on_hit_checkbox.isChecked(),
             decoder_mode=self._selected_decoder_mode(),
+            model_path=DEFAULT_MODEL_PATH if self.model_checkbox.isChecked() else None,
         )
         self.thread.status.connect(self._set_status)
         self.thread.snapshot.connect(self.handle_snapshot)
