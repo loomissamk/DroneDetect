@@ -37,7 +37,9 @@ This dataset was selected specifically because it preserves both fine‑grained 
 
 ### 2.2 Class Structure
 
-The trained checkpoint currently used for inference (`best_model.pt`) is configured for **seven** classes. This is verified at load time by the model-check script, which infers the class count directly from the final classifier layer and binds UI labels accordingly.
+The project ships several checkpoints, all seven-class. The **recommended** one is `best_model_v5.pt` (DroneCNN, trained on the full 98,705-sample Kaggle set on the pop-os-1 GPU, early-stopped at epoch 18): **val accuracy 0.8894, macro-F1 0.8447**, per-class F1 0.77 (DJI) to 0.91 (Noise). The older `best_model.pt` (CNN+GRU+Transformer) and `best_model_v3.pt` (DroneCNN, CPU-trained, val 0.77) are kept for reference. The app's model loader is architecture-agnostic and auto-picks the best available checkpoint (v5 > v4 > v3 > original).
+
+All checkpoints are configured for **seven** classes. This is verified at load time by the model-check script, which infers the class count directly from the final classifier layer and binds UI labels accordingly.
 
 **Active labels (7) — index order matters, must match the training set:**
 

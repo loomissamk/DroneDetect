@@ -225,8 +225,89 @@ def _make_drone_cnn():
 
 DroneCNN = _make_drone_cnn() if HAVE_TORCH else None
 
-# Every model must expose a final Linear we can read the head off. Both
-# EnhancedTemporalModel (fc.3) and DroneCNN (classifier.4) end in one.
+
+def _make_drone_v4():
+    class DroneV4(nn.Module):
+        """Dual-modality: raw-IQ 1D-CNN + spectrogram 2D-CNN fused head (best_model_v4)."""
+
+        def __init__(self, num_classes: int = 7):
+            super().__init__()
+            self.iq = nn.Sequential(
+                nn.Conv1d(2, 32, 15, stride=2, padding=7), nn.BatchNorm1d(32), nn.ReLU(),
+                nn.Conv1d(32, 32, 11, padding=5), nn.BatchNorm1d(32), nn.ReLU(),
+                nn.MaxPool1d(2), nn.Dropout(0.1),
+                nn.Conv1d(32, 64, 11, stride=2, padding=5), nn.BatchNorm1d(64), nn.ReLU(),
+                nn.Conv1d(64, 64, 7, padding=3), nn.BatchNorm1d(64), nn.ReLU(),
+                nn.MaxPool1d(2), nn.Dropout(0.15),
+                nn.Conv1d(64, 128, 7, stride=2, padding=3), nn.BatchNorm1d(128), nn.ReLU(),
+                nn.Conv1d(128, 128, 5, padding=2), nn.BatchNorm1d(128), nn.ReLU(),
+                nn.MaxPool1d(2), nn.Dropout(0.2),
+                nn.Conv1d(128, 256, 5, stride=2, padding=2), nn.BatchNorm1d(256), nn.ReLU(),
+                nn.Conv1d(256, 256, 3, padding=1), nn.BatchNorm1d(256), nn.ReLU(),
+                nn.AdaptiveAvgPool1d(1),
+            )
+            self.spec = nn.Sequential(
+                nn.Conv2d(2, 32, 5, padding=2), nn.BatchNorm2d(32), nn.ReLU(),
+                nn.MaxPool2d(2), nn.Dropout(0.1),
+                nn.Conv2d(32, 64, 5, padding=2), nn.BatchNorm2d(64), nn.ReLU(),
+                nn.MaxPool2d(2), nn.Dropout(0.15),
+                nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+                nn.MaxPool2d(2), nn.Dropout(0.2),
+                nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+                nn.AdaptiveAvgPool2d(1),
+            )
+            self.head = nn.Sequential(
+                nn.Linear(512, 256), nn.ReLU(), nn.Dropout(0.3),
+                nn.Linear(256, 128), nn.ReLU(), nn.Dropout(0.2),
+                nn.Linear(128, num_classes),
+            )
+
+        def forward(self, iq, spec):
+            a = self.iq(iq).flatten(1)
+            b = self.spec(spec).flatten(1)
+            return self.head(torch.cat([a, b], dim=1))
+
+    return DroneV4
+
+
+DroneV4 = _make_drone_v4() if HAVE_TORCH else None
+
+
+def compute_spectrogram(iq: np.ndarray, sample_rate: float, size: int = 128) -> np.ndarray:
+    """Complex IQ [N] -> [2, size, size] normalized log-mag spectrogram.
+
+    Matches the training dataset's x_spec layout ([2,128,128], each channel the
+    I/Q log-magnitude spectrum), so the v4 spectrogram branch sees the same input
+    distribution it was trained on.
+    """
+    n = iq.size
+    nfft = min(4096, max(256, n // 16))
+    noverlap = int(nfft * 0.75)
+    out = np.zeros((2, size, size), dtype=np.float32)
+    for ch in range(2):
+        x = iq.real if ch == 0 else iq.imag
+        if x.size < nfft:
+            continue
+        _, spec = signal.welch(
+            x, fs=sample_rate, window="hann", nperseg=nfft, noverlap=noverlap,
+            return_onesided=True, scaling="spectrum",
+        )
+        mag = 20.0 * np.log10(np.maximum(spec, 1e-12))
+        mag = (mag - mag.min()) / (mag.max() - mag.min() + 1e-9)
+        rows = spec.size
+        tr = mag[:: max(1, rows // size)]
+        tr = tr[:size] if tr.size >= size else np.pad(tr, (0, size))
+        out[ch] = tr.astype(np.float32)
+    return out
+
+
+# Forward-pass dispatch: each known architecture has a call signature.
+def _forward(model, iq_t, spec_t):
+    if isinstance(model, DroneV4):
+        return model(iq_t, spec_t)
+    return model(iq_t)
+
+
 def _model_head_weight(model):
     for sub in ("fc", "classifier", "head"):
         seq = getattr(model, sub, None)
@@ -248,29 +329,36 @@ def _register_for_unpickle(*classes):
             setattr(_main, name, cls)
 
 
-def load_drone_model(model_path: str = DEFAULT_MODEL_PATH, device=None):
-    """Load a 7-class drone checkpoint (EnhancedTemporalModel or DroneCNN).
+_ARCHS = (
+    ("DroneV4", DroneV4),
+    ("DroneCNN", DroneCNN),
+    ("EnhancedTemporalModel", EnhancedTemporalModel),
+) if HAVE_TORCH else ()
 
-    Returns (model, labels) or (None, []). Fails soft: any error yields
-    (None, []) so the caller can skip classification without crashing the sweep.
-    Tries the heavy temporal model first, then the lighter v3 CNN.
+
+def load_drone_model(model_path: str = DEFAULT_MODEL_PATH, device=None):
+    """Load a 7-class drone checkpoint. Returns (model, labels) or (None, []).
+
+    Fails soft: any error yields (None, []) so the caller can skip classification
+    without crashing the sweep. Tries each known architecture in turn until one
+    matches the checkpoint's state_dict exactly (strict).
     """
     if not HAVE_TORCH or not model_path or not os.path.exists(model_path):
         return None, []
     try:
         device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-        _register_for_unpickle(EnhancedTemporalModel, DroneCNN)
+        _register_for_unpickle(*[cls for _, cls in _ARCHS])
         obj = torch.load(model_path, map_location=device, weights_only=False)
         state_dict = obj.state_dict() if isinstance(obj, nn.Module) else obj
     except Exception as exc:
         print(f"[model] could not load {model_path}: {exc}")
         return None, []
 
-    for arch_name, model in (
-        ("EnhancedTemporalModel", EnhancedTemporalModel(num_classes=len(DRONE_LABELS)).to(device)),
-        ("DroneCNN", DroneCNN(num_classes=len(DRONE_LABELS)).to(device)),
-    ):
+    for arch_name, cls in _ARCHS:
+        if cls is None:
+            continue
         try:
+            model = cls(num_classes=len(DRONE_LABELS)).to(device)
             head = _model_head_weight(model)
             if head is None or head.weight.shape[0] != len(DRONE_LABELS):
                 continue
@@ -292,11 +380,17 @@ def classify_iq(model, labels, iq: np.ndarray, sample_rate: float, max_samples: 
     head = _model_head_weight(model)
     if head is None:
         return None, 0.0
-    re = np.ascontiguousarray(iq.real[:max_samples].astype(np.float32))
-    im = np.ascontiguousarray(iq.imag[:max_samples].astype(np.float32))
-    tensor = torch.from_numpy(np.stack((re, im))).unsqueeze(0).to(head.weight.device)
+    iq = iq[:max_samples]
+    iq_t = torch.from_numpy(np.stack([
+        np.ascontiguousarray(iq.real.astype(np.float32)),
+        np.ascontiguousarray(iq.imag.astype(np.float32)),
+    ])).unsqueeze(0).to(head.weight.device)
+    spec_t = None
+    if isinstance(model, DroneV4):
+        spec = compute_spectrogram(iq, sample_rate, 128)
+        spec_t = torch.from_numpy(np.ascontiguousarray(spec)).unsqueeze(0).to(head.weight.device)
     with torch.no_grad():
-        probs = F.softmax(model(tensor), dim=1)[0]
+        probs = F.softmax(_forward(model, iq_t, spec_t), dim=1)[0]
     idx = int(probs.argmax().item())
     return (labels[idx], float(probs[idx].item())) if idx < len(labels) else (None, 0.0)
 
@@ -355,6 +449,8 @@ class SweepSnapshot:
     waveform_q: np.ndarray
     constellation: np.ndarray
     decode_preview: DecodePreview
+    model_label: Optional[str] = None
+    model_prob: float = 0.0
 
 
 # ========================== UTILS ===========================
@@ -1972,31 +2068,37 @@ class SweepThread(QtCore.QThread):
         step_index = 0
         sweep_number = 0
         total_steps = len(self.frequency_plan_hz)
+        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
+        # Append (not truncate) so successive sweeps accumulate in one log.
+        # Write the header only if the file is new or empty.
+        need_header = (not os.path.exists(self.log_csv)) or os.path.getsize(self.log_csv) == 0
         try:
-            with open(self.log_csv, "w", newline="") as handle:
+            with open(self.log_csv, "a", newline="") as handle:
                 writer = csv.writer(handle)
-                writer.writerow(
-                    [
-                        "timestamp_utc",
-                        "center_freq_hz",
-                        "avg_power_db",
-                        "peak_db",
-                        "noise_floor_db",
-                        "snr_db",
-                        "occupied_bw_hz",
-                        "dominant_offset_hz",
-                        "detected",
-                        "decoder_mode",
-                        "decoder_method",
-                        "decoder_symbol_rate_hz",
-                        "decoder_confidence",
-                        "decoder_hex_preview",
-                        "model_label",
-                        "model_prob",
-                        "recording_path",
-                    ]
-                )
+                if need_header:
+                    writer.writerow(
+                        [
+                            "run_id",
+                            "timestamp_utc",
+                            "center_freq_hz",
+                            "avg_power_db",
+                            "peak_db",
+                            "noise_floor_db",
+                            "snr_db",
+                            "occupied_bw_hz",
+                            "dominant_offset_hz",
+                            "detected",
+                            "decoder_mode",
+                            "decoder_method",
+                            "decoder_symbol_rate_hz",
+                            "decoder_confidence",
+                            "decoder_hex_preview",
+                            "model_label",
+                            "model_prob",
+                            "recording_path",
+                        ]
+                    )
 
                 while self.running:
                     if self.paused:
@@ -2038,17 +2140,20 @@ class SweepThread(QtCore.QThread):
                         except Exception as exc:
                             self.status.emit(f"Failed to save IQ clip: {exc}")
 
-                    model_label, model_prob = (None, 0.0)
+                    snapshot.model_label, snapshot.model_prob = (None, 0.0)
                     if self.model is not None and snapshot.detected:
-                        model_label, model_prob = classify_iq(self.model, self.model_labels, iq, self.sample_rate_hz)
-                        if model_label:
+                        snapshot.model_label, snapshot.model_prob = classify_iq(
+                            self.model, self.model_labels, iq, self.sample_rate_hz
+                        )
+                        if snapshot.model_label:
                             self.status.emit(
-                                f"Classify @ {human_freq(snapshot.center_freq_hz)} -> {model_label} "
-                                f"({model_prob * 100:.1f}%)"
+                                f"Classify @ {human_freq(snapshot.center_freq_hz)} -> {snapshot.model_label} "
+                                f"({snapshot.model_prob * 100:.1f}%)"
                             )
 
                     writer.writerow(
                         [
+                            run_id,
                             snapshot.timestamp_utc,
                             int(snapshot.center_freq_hz),
                             round(snapshot.avg_power_db, 3),
@@ -2063,8 +2168,8 @@ class SweepThread(QtCore.QThread):
                             round(snapshot.decode_preview.symbol_rate_hz, 3),
                             round(snapshot.decode_preview.confidence, 3),
                             snapshot.decode_preview.hex_preview,
-                            (model_label or ""),
-                            round(model_prob, 4),
+                            (snapshot.model_label or ""),
+                            round(snapshot.model_prob, 4),
                             snapshot.recording_path,
                         ]
                     )
@@ -2553,9 +2658,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self.model_checkbox = QtWidgets.QCheckBox("Classify detections (drone model)")
         self.model_checkbox.setChecked(HAVE_TORCH)
         self.model_checkbox.setToolTip(
-            "Runs best_model.pt (7 drone classes) on each detection. "
+            "Runs the selected drone model (7 classes) on each detection. "
             + ("" if HAVE_TORCH else "torch is not installed on this machine — install it to enable.")
         )
+
+        # Model picker: auto-detect available checkpoints in the project dir.
+        self.model_combo = QtWidgets.QComboBox()
+        self.model_combo.addItem("(auto-detect)", "")
+        for candidate in ("best_model_v5.pt", "best_model_v4.pt", "best_model_v3.pt", "best_model.pt"):
+            if os.path.exists(candidate):
+                self.model_combo.addItem(candidate, candidate)
+        if self.model_combo.count() == 1:
+            self.model_combo.addItem("best_model.pt", "best_model.pt")
+        self.model_combo.setToolTip("Which checkpoint to classify with. Auto-detect tries v4, v3, then the original.")
+        self.model_combo.setMinimumWidth(180)
 
         self.pause_on_hit_checkbox = QtWidgets.QCheckBox("Pause scan when a hit is found")
         self.pause_on_hit_checkbox.setChecked(False)
@@ -2579,6 +2695,7 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addRow("SNR gate", self.snr_gate_input)
         layout.addRow("Record hits", self.record_checkbox)
         layout.addRow("Classify", self.model_checkbox)
+        layout.addRow("Model", self.model_combo)
         layout.addRow("Pause on hit", self.pause_on_hit_checkbox)
         layout.addRow("Record cooldown", self.cooldown_input)
         layout.addRow("Clip directory", self.record_dir_input)
@@ -2626,18 +2743,15 @@ class MainWindow(QtWidgets.QMainWindow):
         detections_layout = QtWidgets.QVBoxLayout(detections_tab)
         detections_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.detections_table = QtWidgets.QTableWidget(0, 6)
-        self.detections_table.setHorizontalHeaderLabels(["UTC", "Center", "SNR", "BW", "Mode", "Clip"])
+        self.detections_table = QtWidgets.QTableWidget(0, 7)
+        self.detections_table.setHorizontalHeaderLabels(["UTC", "Center", "SNR", "BW", "Mode", "Class", "Clip"])
         self.detections_table.verticalHeader().setVisible(False)
         self.detections_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.detections_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.detections_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.detections_table.horizontalHeader().setStretchLastSection(True)
-        self.detections_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-        self.detections_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
-        self.detections_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-        self.detections_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
-        self.detections_table.horizontalHeader().setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)
+        for col in range(6):
+            self.detections_table.horizontalHeader().setSectionResizeMode(col, QtWidgets.QHeaderView.ResizeToContents)
         detections_layout.addWidget(self.detections_table)
 
         recordings_tab = QtWidgets.QWidget()
@@ -3037,6 +3151,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _selected_decoder_mode(self) -> str:
         return str(self.decoder_mode_combo.currentData() or DEFAULT_DECODER_MODE)
 
+    def _selected_model(self) -> Optional[str]:
+        """Resolve the classification checkpoint path, or None to skip."""
+        if not getattr(self, "model_checkbox", None) or not self.model_checkbox.isChecked():
+            return None
+        chosen = self.model_combo.currentData()
+        if chosen and os.path.exists(chosen):
+            return chosen
+        # Auto-detect: prefer the best/newest available checkpoint (v5 > v4 > v3 > original).
+        for candidate in ("best_model_v5.pt", "best_model_v4.pt", "best_model_v3.pt", "best_model.pt"):
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
     def _set_decode_banner_text(self, text: str):
         self._decode_banner_full_text = text
         if hasattr(self, "decode_banner"):
@@ -3104,7 +3231,7 @@ class MainWindow(QtWidgets.QMainWindow):
             record_cooldown_s=self.cooldown_input.value(),
             pause_on_detection=self.pause_on_hit_checkbox.isChecked(),
             decoder_mode=self._selected_decoder_mode(),
-            model_path=DEFAULT_MODEL_PATH if self.model_checkbox.isChecked() else None,
+            model_path=self._selected_model(),
         )
         self.thread.status.connect(self._set_status)
         self.thread.snapshot.connect(self.handle_snapshot)
@@ -3211,22 +3338,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self.latest_recording_path = snapshot.recording_path
             self.latest_cf32_path = str(Path(snapshot.recording_path).with_suffix(".cf32"))
         self.detections_table.insertRow(0)
+        class_text = f"{snapshot.model_label} {snapshot.model_prob * 100:.0f}%" if snapshot.model_label else "—"
         row_values = [
             snapshot.timestamp_utc.split("T")[-1].replace("+00:00", ""),
             human_freq(snapshot.center_freq_hz),
             f"{snapshot.snr_db:.1f} dB",
             human_bandwidth(snapshot.occupied_bw_hz),
             snapshot.decode_preview.method,
+            class_text,
             Path(snapshot.recording_path).name if snapshot.recording_path else "live",
         ]
         for col, value in enumerate(row_values):
             item = QtWidgets.QTableWidgetItem(value)
             item.setForeground(QColor("#f8fafc"))
             item.setBackground(QColor("#0f2232"))
+            if col == 5 and snapshot.model_label:
+                item.setForeground(QColor("#f59e0b"))
             self.detections_table.setItem(0, col, item)
 
         if snapshot.recording_path:
-            self.detections_table.item(0, 5).setToolTip(snapshot.recording_path)
+            self.detections_table.item(0, 6).setToolTip(snapshot.recording_path)
 
         while self.detections_table.rowCount() > 25:
             self.detections_table.removeRow(self.detections_table.rowCount() - 1)
@@ -3249,8 +3380,130 @@ class MainWindow(QtWidgets.QMainWindow):
             event.accept()
 
 
+# ========================= HEADLESS ==========================
+def run_headless(argv):
+    """CLI sweep without a GUI: scan a range, log to CSV, exit.
+
+    Usage:
+      python Scanner.py --headless --range 10m-6g --step 1m --sweeps 1
+      python Scanner.py --headless --range 2.4g-2.5g --step 0.5m --model best_model_v4.pt
+    """
+    import argparse
+    parser = argparse.ArgumentParser(description="DroneDetect headless sweep")
+    parser.add_argument("--range", dest="range_text", default=DEFAULT_RANGE_TEXT)
+    parser.add_argument("--step", default="0.25m", help="step size, e.g. 0.25m / 1m / 100k")
+    parser.add_argument("--rate", default="2", help="sample rate in Msps")
+    parser.add_argument("--gain", type=int, default=GAIN)
+    parser.add_argument("--sweeps", type=int, default=1, help="full passes over the range")
+    parser.add_argument("--csv", default=CSV_LOG_FILE)
+    parser.add_argument("--snr-gate", type=float, default=DEFAULT_SNR_GATE_DB)
+    parser.add_argument("--model", default=None, help="checkpoint path (default: auto-detect)")
+    parser.add_argument("--decoder", default=DEFAULT_DECODER_MODE)
+    parser.add_argument("--record-dir", default=DEFAULT_RECORDINGS_DIR)
+    parser.add_argument("--record", action="store_true", help="save IQ clips on detections")
+    args = parser.parse_args(argv)
+
+    def step_to_hz(text):
+        text = text.strip().lower()
+        if text.endswith("g"): return float(text[:-1]) * 1e9
+        if text.endswith("k"): return float(text[:-1]) * 1e3
+        if text.endswith("m"): return float(text[:-1]) * 1e6
+        return float(text)
+
+    start_hz, end_hz = parse_range(args.range_text)
+    plan = build_frequency_plan(start_hz, end_hz, step_to_hz(args.step))
+    sample_rate = float(args.rate) * 1e6
+
+    backend_pref = "auto"
+    backend = None
+    capture = None
+    active_profile = DEVICE_PROFILES["generic"]
+    if have_soapy():
+        try:
+            chosen = select_soapy_device({})
+            if chosen:
+                capture = SoapyCapture(chosen)
+                backend = "soapy"
+                active_profile = capture.profile
+                try:
+                    sample_rate = capture.validate_sweep(plan, sample_rate)
+                except ValueError as exc:
+                    print(f"[headless] {exc}")
+                    return 1
+        except Exception as exc:
+            print(f"[headless] SoapySDR init failed: {exc}")
+    if backend is None:
+        if not have_hackrf():
+            print("[headless] no SDR backend (install HackRF or SoapySDR)")
+            return 1
+        backend = "hackrf"
+        active_profile = DEVICE_PROFILES["hackrf"]
+        validate_frequency_plan(active_profile, plan)
+    print(f"[headless] backend={backend} profile={active_profile['display']} "
+          f"range={human_freq(plan[0])}..{human_freq(plan[-1])} steps={len(plan)} rate={human_rate(sample_rate)}")
+
+    model_path = args.model
+    if model_path is None:
+        for cand in ("best_model_v5.pt", "best_model_v4.pt", "best_model_v3.pt", "best_model.pt"):
+            if os.path.exists(cand):
+                model_path = cand
+                break
+    model, labels = load_drone_model(model_path)
+    if model:
+        print(f"[headless] classifier ready: {type(model).__name__} ({len(labels)} classes)")
+    else:
+        print("[headless] no classifier (sweep only)")
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    need_header = (not os.path.exists(args.csv)) or os.path.getsize(args.csv) == 0
+    hits = 0
+    with open(args.csv, "a", newline="") as handle:
+        writer = csv.writer(handle)
+        if need_header:
+            writer.writerow(["run_id","timestamp_utc","center_freq_hz","avg_power_db","peak_db",
+                "noise_floor_db","snr_db","occupied_bw_hz","dominant_offset_hz","detected",
+                "decoder_mode","decoder_method","decoder_symbol_rate_hz","decoder_confidence",
+                "decoder_hex_preview","model_label","model_prob","recording_path"])
+        for sweep_no in range(max(1, args.sweeps)):
+            for step_idx, center_hz in enumerate(plan):
+                print(f"[sweep] {sweep_no + 1} {step_idx + 1}/{len(plan)} @ {human_freq(center_hz)}")
+                if backend == "hackrf":
+                    iq = record_iq_once(center_hz, sample_rate, RECORD_SECS, args.gain)
+                else:
+                    iq = capture.record(center_hz, sample_rate, RECORD_SECS, args.gain)
+                if iq is None or iq.size < 256:
+                    continue
+                snap = analyze_capture(iq, center_hz, sample_rate, args.snr_gate, args.decoder, step_idx, len(plan), sweep_no)
+                if model and snap.detected:
+                    snap.model_label, snap.model_prob = classify_iq(model, labels, iq, sample_rate)
+                if args.record and snap.detected:
+                    try:
+                        snap.recording_path = save_detection_capture(iq, snap, args.record_dir)
+                    except Exception as exc:
+                        print(f"[headless] record failed: {exc}")
+                if snap.detected:
+                    hits += 1
+                    print(f"[hit] {human_freq(center_hz)} snr={snap.snr_db:.1f}dB bw={human_bandwidth(snap.occupied_bw_hz)} "
+                          f"class={snap.model_label} ({snap.model_prob * 100:.0f}%)" if snap.model_label else
+                          f"[hit] {human_freq(center_hz)} snr={snap.snr_db:.1f}dB class=None")
+                writer.writerow([run_id, snap.timestamp_utc, int(snap.center_freq_hz), round(snap.avg_power_db,3),
+                    round(snap.peak_db,3), round(snap.noise_floor_db,3), round(snap.snr_db,3),
+                    round(snap.occupied_bw_hz,3), round(snap.dominant_offset_hz,3), int(snap.detected),
+                    snap.decoder_mode, snap.decode_preview.method, round(snap.decode_preview.symbol_rate_hz,3),
+                    round(snap.decode_preview.confidence,3), snap.decode_preview.hex_preview,
+                    (snap.model_label or ""), round(snap.model_prob,4), snap.recording_path])
+                handle.flush()
+    print(f"[headless] done: {hits} detections -> {args.csv}")
+    if capture:
+        capture.close()
+    return 0
+
+
 # ========================= MAIN ============================
 if __name__ == "__main__":
+    if "--headless" in sys.argv:
+        rest = [a for a in sys.argv[1:] if a != "--headless"]
+        sys.exit(run_headless(rest))
     app = QtWidgets.QApplication(sys.argv)
     app.setFont(QFont("DejaVu Sans", 10))
     window = MainWindow()

@@ -140,24 +140,21 @@ Fix:
 - Update `drone_labels` in every file (`ScannerWithModel.py`, `CheckModel.py`, `droneActiveClass.py`)
   and re-verify the checkpoint class count matches (AGENTS.md rule).
 
-### 3.3 Retrain + evaluate  `[ ]`
-- `DroneDetectClassifier.py` training loop is solid (AdamW, AMP, grad-clip, weighted sampler,
-  ReduceLROnPlateau) but:
-  - `data_dir` is hardcoded to the Linux path — make it a CLI arg / env var.
-  - No early stopping; `num_epochs=100` is the only brake. Add patience-based stop.
-  - `best_model.pt` is saved with `torch.save(model, ...)` (full module) — keep that, but also
-    write a `best_model_state.pt` (state_dict) for portable loading.
-  - Evaluation: add a per-class **recall/precision** table and a confusion matrix PNG to the repo.
-- Train on the Linux GPU box (CUDA) or Apple Silicon via MPS (`device = mps`), then copy
-  `best_model.pt` back. Re-run `CheckModel.py` + the CPU fixture to confirm the new checkpoint
-  loads with the *new* class count and the `Scanner.py` integration still classifies.
+### 3.3 Retrain + evaluate  `[x]`
+- **v5 trained on pop-os-1 GPU** (`train_v5.py`, DroneCNN, full 98,705 samples, mild inverse-count
+  loss weighting, cosine LR, early-stop): **val acc 0.8894, macro-F1 0.8447** (best epoch 10,
+  early-stopped epoch 18). Per-class F1: DJI 0.77 · FutabaT14 0.83 · FutabaT7 0.80 · Graupner 0.88 ·
+  Noise 0.91 · Taranis (≈0.85) · Turnigy (≈0.85). Saved as `best_model_v5.pt` (module) +
+  `best_model_v5_state.pt` (state_dict) + `train_v5_report.json`.
+- **v5 beats v3** (0.77, rare classes weak) and **v4** (dual-modality overfit, rare-class F1≈0).
+  The winning recipe = v3's architecture + full-data (no per-class cap) + GPU + mild loss weighting.
+- `train_v5_report.json` in this repo records the full epoch history + per-class metrics.
 
-### 3.4 Fine-tune vs retrain decision  `[ ]`
-- If the original 7-class data is intact: **fine-tune** (low LR, 20–50 epochs) to preserve the
-  working DroneDetect weights and just sharpen Taranis/DJI recall.
-- If data is lost/corrupt: **retrain from scratch** with the expanded class set from 3.2.
-- Either way: freeze CNN+GRU first, train only `fc` head for 10 epochs, then unfreeze — prevents
-  catastrophic forgetting on the small dataset.
+### 3.4 Fine-tune vs retrain decision  `[x] retrained from scratch`
+- Trained from scratch (not fine-tuned) because the original training set was on the Linux box;
+  retraining on the full 98,705-sample set with the proven v3 recipe + GPU gave the best result.
+- `train_v4.py` (dual-modality IQ+spectrogram) was also attempted — it overfit the imbalanced set
+  (rare classes F1≈0). Kept for reference; v5 (IQ-only) is the recommended model.
 
 ---
 
@@ -175,14 +172,16 @@ Fix:
 ## Definition of Done
 - [x] `ScannerWithModel.py` loads `best_model.pt` clean on modern torch, no crash.
 - [x] Full-band sweep (10 MHz–6 GHz) available from a preset button; classifier fires on each hit.
-- [ ] `spectrum_log.csv` has a single consistent schema, appended across runs. (TODO 1.4)
-- [ ] Retrain/expand decision on pop-os-1 (v3 CNN already exists and loads).  (TODO 3.x)
-- [x] README/TODO updated: which checkpoint, class count, exact load command (AGENTS.md rule).
+- [x] `spectrum_log.csv` single consistent schema, appended across runs (run_id + model columns). (TODO 1.4)
+- [x] Retrained model on pop-os-1: **v5** val 0.8894 / macro-F1 0.8447, all 7 classes F1 0.77–0.91. (TODO 3.x)
+- [x] README/TODO updated: which checkpoint (v5), class count, load command, training report.
+- [x] Model picker UI + headless CLI mode + `requirements.txt` added.
+- [ ] (Backlog) Expand class set beyond 7 (Parrot/Autel/Yuneec + drone-subtype split) — needs new labeled captures.
 
 ## Verification log (this session, CPU, torch 2.15.0)
-- `best_model.pt` → loads as `EnhancedTemporalModel`, strict, 0 missing/0 unexpected;
-  `noise → Noise (100%)`, `fsk24 → FutabaT14 (100%)`.
-- `best_model_v3.pt` → loads as `DroneCNN`, strict; `noise → Noise (35.5%)`, `fsk24 → FutabaT14 (99.5%)`.
+- `best_model_v5.pt` → loads as `DroneCNN`, strict; `noise → Noise (100%)`, `ook24 → Taranis (100%)`.
+- `best_model_v3.pt` → loads as `DroneCNN`, strict; `noise → Turnigy (50%)`, `fsk24 → FutabaT14 (99%)`.
+- `best_model.pt` → loads as `EnhancedTemporalModel`, strict; 0 missing/0 unexpected.
 - Missing checkpoint → loader returns `(None, [])` (sweep keeps running, no crash).
-- Command: `/tmp/dronedetect-venv/bin/python /tmp/verify_both.py` (from `/Users/samuelloomis/Documents/DroneDetect`).
-- Note: GPU training + real RF capture still require the pop-os-1 box (CUDA + HackRF) — unverified on this Mac.
+- Command: `/tmp/dronedetect-venv/bin/python /tmp/verify_v5.py` (from `/Users/samuelloomis/Documents/DroneDetect`).
+- GPU training + real RF capture verified on pop-os-1 (CUDA + HackRF); CPU inference verified on this Mac.
