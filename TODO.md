@@ -4,15 +4,41 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ---
 
+## 0. REMOTE-BOX FINDINGS (pop-os-1, user `bat`, SSH alias `gaming`, Tailscale 100.107.226.49)
+Discovered during this session — the training environment and the *real* data live there:
+- **HackRF One SDR** live (`Bus 009 Device 002 … HackRF One`) + `hackrf_transfer` in PATH.
+- **Full Kaggle dataset** (98,705 samples, 25 GB `dataset.pt`):
+  `/home/bat/DroneDetect-work/data/kaggle_drone_rf/{dataset.pt, class_stats.csv, SNR_stats.csv}`
+- **Newer, better model** already trained there: `best_model_v3.pt` (2.4 MB pure-CNN `DroneCNN`,
+  `train_v3.py`, trained on all 98,705 samples) — vs. the older 15 MB `best_model.pt` (CNN+GRU+Transformer)
+  in this repo. Both are now pulled into this repo and load via the architecture-agnostic loader.
+- A live full-band sweep dashboard runs it: `/home/bat/DroneDetect-work/drone_full_dashboard.py` (cuda).
+- **Authoritative label order** (train_v3.py, class_stats.csv, dashboard all agree):
+  `0=DJI 1=FutabaT14 2=FutabaT7 3=Graupner 4=Noise 5=Taranis 6=Turnigy`.
+- Class balance: Noise 52,552 (53%) · Taranis 16,546 · Turnigy 10,333 · FutabaT14 6,938 ·
+  Graupner 6,481 · FutabaT7 3,661 · DJI 2,194. SNR balanced −20…+30 dB (~3,800 each).
+- Training runs in a Docker container (`dronedetect:latest`, `start.sh`); host has no system torch.
+
+---
+
 ## 1. EASY — config & correctness fixes (no data, no training)
 
-### 1.1 Fix the "only predicts Taranis" bug  `[ ]`
-- Root cause (confirmed by test): checkpoint `best_model.pt` has a **7-class** head
-  (`fc.3.weight = [7,128]`), but `ScannerWithModel.py:137` builds an **8-class** model and
-  `drop_non_drone()` slices index 7. On modern torch this **crashes on startup**
-  (`size mismatch fc.3.weight [7,128] vs [8,128]`); on old torch class 7 loads random
-  weights and the label→index mapping shifts, so one class dominates.
-- Fix:
+### 1.1 Fix the "only predicts Taranis" bug  `[x]`
+**Two distinct bugs, both confirmed by CPU test and fixed:**
+
+**(a) Label-order misalignment (the true root cause).** The Kaggle dataset trains
+**index 4 = Noise** (the dominant class, 52,552/98,705 ≈ 53%). But every code file listed
+`[DJI, FutabaT14, FutabaT7, Graupner, Taranis, Turnigy, Noise]`, putting **Taranis at index 4**.
+So the model correctly predicted index 4 = Noise, and the UI printed it as "Taranis."
+Fix: reordered `drone_labels` / `DRONE_LABELS` to the true training order
+`[DJI, FutabaT14, FutabaT7, Graupner, Noise, Taranis, Turnigy]` in `ScannerWithModel.py`,
+`CheckModel.py`, `Scanner.py`. After the fix: `noise -> Noise`, `fsk24 -> FutabaT14/T7` (correct).
+
+**(b) 8-class load bug (secondary).** `best_model.pt` has a **7-class** head
+(`fc.3.weight = [7,128]`), but `ScannerWithModel.py:137` built an **8-class** model and
+`drop_non_drone()` sliced index 7 — a **size-mismatch crash on modern torch**
+(`[7,128] vs [8,128]`); on old torch class 7 loaded random weights and shifted the mapping.
+Fix:
   - `ScannerWithModel.py:136-149` — build `EnhancedTemporalModel(num_classes=7)`,
     `load_state_dict(strict=True)`, remove `drop_non_drone()` and `NON_DRONE_IDX_IN_OLD`.
   - Verify `drone_labels` order matches training label order (DJI, FutabaT14, FutabaT7,
@@ -21,7 +47,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done
   - `droneActiveClass.py` already assumes 7 classes — confirm no stray 8th index.
 - Verify: CPU fixture inference loads clean, 0 missing/0 unexpected keys, all 7 classes reachable.
 
-### 1.2 Full-band 1 MHz–6 GHz defaults + band presets  `[ ]`
+### 1.2 Full-band 1 MHz–6 GHz defaults + band presets  `[x]`
 - `Scanner.py:50-66` — `DEFAULT_START_FREQ`/`DEFAULT_END_FREQ` are already 10 MHz–6 GHz,
   but `apply_device_defaults()` overwrites the Range box with narrow per-profile ranges
   (generic/rtlsdr → 433.8–434.2 MHz, hackrf → 2.400–2.500 GHz). That's the "current mode" trap.
@@ -35,7 +61,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done
     SDRplay ~2 GHz, HackRF 1 MHz–6 GHz). Keep `validate_frequency_plan` but surface device limits.
 - Verify: UI preset sets the fields; `build_frequency_plan` accepts full band at chosen step.
 
-### 1.3 Wire the classifier into the real inspector (`Scanner.py`)  `[ ]`
+### 1.3 Wire the classifier into the real inspector (`Scanner.py`)  `[x]`
 - Currently the **only** model path is the broken `ScannerWithModel.py`; the nicer
   `Scanner.py` sweep loop never calls the model. Unify them:
   - Add optional `--model best_model.pt` to `Scanner.py`. When set, run the 7-class
@@ -92,7 +118,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ## 3. HARD — model retraining & data
 
-### 3.1 Acquire / rebuild the training dataset  `[ ]`
+### 3.1 Acquire / rebuild the training dataset  `[~] data found on pop-os-1`
 - Current training data path (`DroneDetectClassifier.py:200`) is
   `/home/batman/Desktop/drone_rf_data/drone_RF_data` — a **Linux box, not this PC**.
   The `.pt` samples (2 × N IQ) are not in this checkout.
@@ -147,8 +173,16 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done
 ---
 
 ## Definition of Done
-- [ ] `ScannerWithModel.py` loads `best_model.pt` clean on modern torch, no crash.
-- [ ] Full-band sweep (10 MHz–6 GHz) runs from a preset button, classifier fires on each hit.
-- [ ] `spectrum_log.csv` has a single consistent schema, appended across runs.
-- [ ] New `best_model.pt` (retrained) passes `CheckModel.py` + a 3-signal CPU fixture.
-- [ ] README updated: which checkpoint, class count, exact load command (AGENTS.md rule).
+- [x] `ScannerWithModel.py` loads `best_model.pt` clean on modern torch, no crash.
+- [x] Full-band sweep (10 MHz–6 GHz) available from a preset button; classifier fires on each hit.
+- [ ] `spectrum_log.csv` has a single consistent schema, appended across runs. (TODO 1.4)
+- [ ] Retrain/expand decision on pop-os-1 (v3 CNN already exists and loads).  (TODO 3.x)
+- [x] README/TODO updated: which checkpoint, class count, exact load command (AGENTS.md rule).
+
+## Verification log (this session, CPU, torch 2.15.0)
+- `best_model.pt` → loads as `EnhancedTemporalModel`, strict, 0 missing/0 unexpected;
+  `noise → Noise (100%)`, `fsk24 → FutabaT14 (100%)`.
+- `best_model_v3.pt` → loads as `DroneCNN`, strict; `noise → Noise (35.5%)`, `fsk24 → FutabaT14 (99.5%)`.
+- Missing checkpoint → loader returns `(None, [])` (sweep keeps running, no crash).
+- Command: `/tmp/dronedetect-venv/bin/python /tmp/verify_both.py` (from `/Users/samuelloomis/Documents/DroneDetect`).
+- Note: GPU training + real RF capture still require the pop-os-1 box (CUDA + HackRF) — unverified on this Mac.

@@ -39,17 +39,25 @@ This dataset was selected specifically because it preserves both fine‑grained 
 
 The trained checkpoint currently used for inference (`best_model.pt`) is configured for **seven** classes. This is verified at load time by the model-check script, which infers the class count directly from the final classifier layer and binds UI labels accordingly.
 
-**Active labels (7):**
+**Active labels (7) — index order matters, must match the training set:**
 
-* DJI
-* Futaba T14
-* Futaba T7
-* Graupner
-* FrSky Taranis
-* Turnigy
-* Noise (non-drone / background RF)
+* 0 — DJI
+* 1 — Futaba T14
+* 2 — Futaba T7
+* 3 — Graupner
+* 4 — Noise (non-drone / background RF)
+* 5 — FrSky Taranis
+* 6 — Turnigy
 
-The explicit **Noise** class is a deliberate design choice: a practical RF system must be able to reject non-target RF activity rather than force every observation into a drone/controller label.
+The **Noise** class is index 4 (deliberate, per the Kaggle dataset `class_stats.csv`),
+the dominant class at ~53% of samples. The explicit **Noise** class is a deliberate
+design choice: a practical RF system must be able to reject non-target RF activity
+rather than force every observation into a drone/controller label.
+
+> Note: an earlier copy of this project listed Noise last (index 6). Because the
+> model overwhelmingly predicts index 4, that misordering printed "Taranis" for
+> what was actually Noise — the "only predicts Taranis" bug. All label lists
+> (`ScannerWithModel.py`, `CheckModel.py`, `Scanner.py`) now use the order above.
 
 ---
 
